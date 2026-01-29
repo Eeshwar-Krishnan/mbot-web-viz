@@ -85,15 +85,42 @@
   flex-direction: column;
 }
 
-.u-under {
-    position: absolute;
-}
+    .u-under {
+        position: absolute;
+    }
 
-#chart canvas {
-  width: 100% !important;
-  height: 100% !important;
-  image-rendering: crisp-edges;
-}
+    #chart canvas {
+      width: 100% !important;
+      height: 100% !important;
+      image-rendering: crisp-edges;
+    }
+
+    /* Gyro visualizer */
+    #gyroViz {
+      display: none;
+      margin-top: 8px;
+      padding: 8px;
+      border: 1px solid #22283a;
+      border-radius: 8px;
+      background: #0e1017;
+    }
+
+    #gyroVizHeader {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+    }
+
+    #gyroCanvas {
+      width: 100%;
+      height: 200px;
+      display: block;
+    }
 
   </style>
 </head>
@@ -103,6 +130,15 @@
       <h1>Realtime Graph</h1>
       <div class="controls">
         <label>Window (s) <input id="winSec" type="number" min="1" step="1" value="30"></label>
+        <label>Mode
+          <select id="viewMode">
+            <option value="time" selected>Time</option>
+            <option value="fft">FFT</option>
+            <option value="pid">PID</option>
+          </select>
+        </label>
+        <label id="fftMaxHzWrap" style="display:none">Max Hz <input id="fftMaxHz" type="number" min="1" step="1" value="50"></label>
+        <label><input id="gyroToggle" type="checkbox"> Gyro</label>
         <button id="pauseBtn" class="btn">Pause</button>
         <button id="clearBtn" class="btn warn">Clear</button>
         <button id="saveBtn" class="btn primary">Save CSV</button>
@@ -117,6 +153,13 @@
             </div>
         </div>
         <div class="legend" id="legend"></div>
+        <div id="gyroViz">
+          <div id="gyroVizHeader">
+            <div>Gyro (X/Y)</div>
+            <div id="gyroText">—</div>
+          </div>
+          <canvas id="gyroCanvas" width="600" height="200"></canvas>
+        </div>
       </section>
       <aside class="right">
         <div class="group">
@@ -126,7 +169,7 @@
         <div class="group">
           <h3>Notes</h3>
           <div style="color:var(--muted); font-size:12px; line-height:1.5">
-            Data is buffered in the browser only. Server does not store points. First header/value must be <code>time</code> (seconds).
+            Data is buffered in the browser only. Server does not store points. First header/value is <code>__time_start</code> (seconds since server start).
           </div>
         </div>
       </aside>
@@ -147,153 +190,397 @@ var uPlot=function(){"use strict";function e(e,t,l,n){let i;l=l||0;let s=2147483
     const legendEl = document.getElementById('legend');
     const statusEl = document.getElementById('status');
     const winInput = document.getElementById('winSec');
+    const modeSel = document.getElementById('viewMode');
+    const fftMaxHzWrap = document.getElementById('fftMaxHzWrap');
+    const fftMaxHzInput = document.getElementById('fftMaxHz');
+    const gyroToggle = document.getElementById('gyroToggle');
+    const gyroViz = document.getElementById('gyroViz');
+    const gyroText = document.getElementById('gyroText');
+    const gyroCanvas = document.getElementById('gyroCanvas');
     const pauseBtn = document.getElementById('pauseBtn');
     const clearBtn = document.getElementById('clearBtn');
     const saveBtn = document.getElementById('saveBtn');
 
+    const gyroCtx = gyroCanvas.getContext('2d');
+
     let paused = false;
-    let headers = ["time"]; // default until received
+    let viewMode = 'time'; // time | fft | pid
+    let roles = {}; // role -> header name (from server meta)
+    let savedVisible = null;
+
+    let headers = ['__time_start'];
     let times = [];
     let dataSeries = []; // array of arrays for each non-time series
-    let autoscale = [];  // per-series autoscale flags
-    let manualMin = [];  // per-series min
-    let manualMax = [];  // per-series max
-    let visible = [];    // per-series visibility
-    let refLineEnabled = [];  // per-series reference line enabled
-    let refLineValue = [];    // per-series reference line y-value
+    let autoscale = [];
+    let manualMin = [];
+    let manualMax = [];
+    let visible = [];
+    let refLineEnabled = [];
+    let refLineValue = [];
+
     let colorPalette = ["#7aa2f7","#c3e88d","#f7768e","#ff9e64","#9ece6a","#bb9af7","#2ac3de","#e0af68"]; 
+
+    // Derived plot buffers (time/FFT)
+    let plotX = [];
+    let plotSeries = [];
 
     let uplot = null;
     let redrawTimer = null;
+    let fftTimer = null;
 
-    function nowSec(){ return (Date.now()/1000); }
+    function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
+
+    function getHeaderIndex(headerName){
+      if(!headerName) return -1;
+      return headers.indexOf(headerName);
+    }
+
+    function guessHeaderIndex(regexList){
+      for(const rx of regexList){
+        for(let i=1;i<headers.length;i++){
+          if(rx.test(headers[i])) return i;
+        }
+      }
+      return -1;
+    }
+
+    function getPidIndices(){
+      let pidIdx = getHeaderIndex(roles.pid);
+      if(pidIdx < 0) pidIdx = guessHeaderIndex([/^pid$/i,/pid/i,/angle/i,/theta/i]);
+
+      let setpointIdx = getHeaderIndex(roles.setpoint);
+      if(setpointIdx < 0) setpointIdx = guessHeaderIndex([/setpoint/i,/target/i,/reference/i,/ref/i]);
+
+      if(pidIdx === setpointIdx) setpointIdx = -1;
+      return {pidIdx, setpointIdx};
+    }
+
+    function getGyroIndices(){
+      let gxIdx = getHeaderIndex(roles.gyroX);
+      if(gxIdx < 0) gxIdx = guessHeaderIndex([/^gyro_?x$/i,/^gx$/i,/gyro.*x/i,/angle_?x/i]);
+
+      let gyIdx = getHeaderIndex(roles.gyroY);
+      if(gyIdx < 0) gyIdx = guessHeaderIndex([/^gyro_?y$/i,/^gy$/i,/gyro.*y/i,/angle_?y/i]);
+
+      if(gxIdx === gyIdx) gyIdx = -1;
+      return {gxIdx, gyIdx};
+    }
+
+    function updateModeUi(){
+      fftMaxHzWrap.style.display = (viewMode === 'fft') ? '' : 'none';
+
+      if(viewMode === 'pid'){
+        const {pidIdx, setpointIdx} = getPidIndices();
+        if(pidIdx < 0 || setpointIdx < 0){
+          statusEl.textContent = 'PID: missing channels';
+        }
+      }
+
+      // Lock series selection while in PID mode.
+      if(viewMode === 'pid'){
+        if(savedVisible == null) savedVisible = visible.slice();
+        const {pidIdx, setpointIdx} = getPidIndices();
+        visible = visible.map(()=>false);
+        if(pidIdx > 0) visible[pidIdx-1] = true;
+        if(setpointIdx > 0) visible[setpointIdx-1] = true;
+      } else if(savedVisible != null){
+        visible = savedVisible.slice();
+        savedVisible = null;
+      }
+
+      renderSeriesList();
+      rebuildChart();
+    }
+
+    // ---- FFT (client-side) ----
+    function isPow2(n){ return (n & (n-1)) === 0; }
+    function floorPow2(n){
+      let p = 1;
+      while(p*2 <= n) p *= 2;
+      return p;
+    }
+
+    function bitReverse(n, bits){
+      let reversed = 0;
+      for(let i=0;i<bits;i++){
+        reversed = (reversed << 1) | (n & 1);
+        n >>= 1;
+      }
+      return reversed;
+    }
+
+    function fftRadix2(re, im){
+      const n = re.length;
+      if(n <= 1) return;
+      if(!isPow2(n)) throw new Error('FFT length must be pow2');
+
+      const bits = Math.log2(n) | 0;
+      for(let i=0;i<n;i++){
+        const j = bitReverse(i, bits);
+        if(j > i){
+          let tr = re[i]; re[i] = re[j]; re[j] = tr;
+          let ti = im[i]; im[i] = im[j]; im[j] = ti;
+        }
+      }
+
+      for(let size=2; size<=n; size*=2){
+        const half = size/2;
+        const theta = -2 * Math.PI / size;
+        for(let start=0; start<n; start+=size){
+          for(let k=0; k<half; k++){
+            const wr = Math.cos(theta*k);
+            const wi = Math.sin(theta*k);
+            const i = start + k;
+            const j = i + half;
+            const tr = wr*re[j] - wi*im[j];
+            const ti = wr*im[j] + wi*re[j];
+            re[j] = re[i] - tr;
+            im[j] = im[i] - ti;
+            re[i] = re[i] + tr;
+            im[i] = im[i] + ti;
+          }
+        }
+      }
+    }
+
+    function computeFftData(){
+      // Use current time-windowed buffer
+      if(times.length < 4){
+        plotX = [];
+        plotSeries = dataSeries.map(()=>[]);
+        return;
+      }
+
+      // Estimate sample rate from time deltas
+      let dtSum = 0;
+      let dtCount = 0;
+      for(let i=1;i<times.length;i++){
+        const dt = times[i] - times[i-1];
+        if(dt > 0 && isFinite(dt)) { dtSum += dt; dtCount++; }
+      }
+      if(dtCount < 2){
+        plotX = [];
+        plotSeries = dataSeries.map(()=>[]);
+        return;
+      }
+
+      const dt = dtSum / dtCount;
+      const fs = 1.0 / dt;
+
+      const n0 = floorPow2(times.length);
+      const n = Math.max(16, n0);
+      const startIdx = Math.max(0, times.length - n);
+
+      // Frequency bins up to Nyquist
+      const halfN = (n/2) | 0;
+      const maxHz = Math.max(1, Number(fftMaxHzInput.value) || 50);
+      const hz = [];
+      const maxBin = Math.min(halfN, Math.floor(maxHz * n / fs));
+      for(let k=0;k<=maxBin;k++) hz.push(k * fs / n);
+
+      plotX = hz;
+      plotSeries = dataSeries.map((arr, sidx)=>{
+        if(!visible[sidx]) return Array.from({length: hz.length}, ()=>null);
+
+        const re = new Array(n).fill(0);
+        const im = new Array(n).fill(0);
+        for(let i=0;i<n;i++){
+          const v = arr[startIdx + i];
+          const w = 0.5 * (1 - Math.cos(2*Math.PI*i/(n-1))); // Hann
+          re[i] = (v == null ? 0 : v) * w;
+        }
+
+        try {
+          fftRadix2(re, im);
+        } catch (e) {
+          return Array.from({length: hz.length}, ()=>null);
+        }
+
+        const mags = [];
+        for(let k=0;k<=maxBin;k++){
+          const mag = Math.sqrt(re[k]*re[k] + im[k]*im[k]) / n;
+          mags.push(mag);
+        }
+        return mags;
+      });
+    }
+
+    // ---- Plot construction ----
+    function getXAxisRange(){
+      if(viewMode === 'fft'){
+        const maxHz = Math.max(1, Number(fftMaxHzInput.value) || 50);
+        return [0, maxHz];
+      }
+
+      const ws = Number(winInput.value) || 30;
+      const xmax = times.length ? times[times.length-1] : 1;
+      return [Math.max(0, xmax - ws), Math.max(xmax, ws)];
+    }
+
+    function computePlotBuffers(){
+      pruneOld();
+      if(viewMode === 'fft') computeFftData();
+      else {
+        plotX = times;
+        plotSeries = dataSeries;
+      }
+    }
+
+    function getScaleNameForSeriesIndex(seriesIdx){
+      // seriesIdx is 0-based into dataSeries (not including x)
+      if(viewMode === 'pid') return 'y0';
+      let visibleIndex = 0;
+      for(let i=0;i<seriesIdx;i++) if(visible[i]) visibleIndex++;
+      return 'y' + visibleIndex;
+    }
 
     function buildScalesAndAxes(){
       const scales = {
         x: {
-          time: false, // Not a time scale, just numbers
-          range: (u,min,max)=>{ const ws = Number(winInput.value)||30; const xmax = times.length? times[times.length-1] : 1; return [Math.max(0,xmax-ws), Math.max(xmax, ws)]; }
+          time: false,
+          range: () => getXAxisRange(),
         }
       };
+
+      const xLabel = (viewMode === 'fft') ? 'Hz' : headers[0];
       const axes = [
-        { 
-          stroke:'#9aa4b2', 
-          grid:{ show:true, stroke:'rgba(154,164,178,0.15)', width:1 }, 
-          ticks:{ stroke:'#9aa4b2' }, 
+        {
+          stroke:'#9aa4b2',
+          grid:{ show:true, stroke:'rgba(154,164,178,0.15)', width:1 },
+          ticks:{ stroke:'#9aa4b2' },
           border:{ show:false },
-          values: (u, vals) => vals.map(v => v.toFixed(1)) // Format as numbers, not dates
+          label: xLabel,
+          values: (u, vals) => vals.map(v => (viewMode === 'fft' ? v.toFixed(1) : v.toFixed(1))),
         }
       ];
-      
-      let visibleIndex = 0;
-      headers.slice(1).forEach((h,i)=>{
-        if(visible[i]) {
-          const scaleName = 'y' + visibleIndex;
-          scales[scaleName] = {
-            range: (u,min,max)=>{
-              if(!autoscale[i]){
-                const lo = (manualMin[i]!=null)? manualMin[i] : min;
-                const hi = (manualMax[i]!=null)? manualMax[i] : max;
-                return [lo, hi];
-              }
-              // autoscale from current data window
-              let lo = Number.POSITIVE_INFINITY, hi = Number.NEGATIVE_INFINITY;
-              const arr = dataSeries[i]||[];
+
+      if(viewMode === 'pid'){
+        scales.y0 = {
+          range: (u, min, max) => {
+            // Shared autoscale over all visible series
+            let lo = Number.POSITIVE_INFINITY;
+            let hi = Number.NEGATIVE_INFINITY;
+            for(let i=0;i<plotSeries.length;i++){
+              if(!visible[i]) continue;
+              const arr = plotSeries[i] || [];
               for(let k=0;k<arr.length;k++){
                 const v = arr[k];
                 if(v==null) continue;
                 if(v<lo) lo=v; if(v>hi) hi=v;
               }
-              if(!isFinite(lo) || !isFinite(hi)){
-                lo = 0; hi = 1;
-              }
-              if(lo===hi){ lo -= 1; hi += 1; }
+            }
+            if(!isFinite(lo) || !isFinite(hi)) { lo = 0; hi = 1; }
+            if(lo===hi){ lo -= 1; hi += 1; }
+            return [lo, hi];
+          }
+        };
+        axes.push({ side:3, scale:'y0', stroke:'#9aa4b2', grid:{ show:false }, ticks:{ stroke:'#9aa4b2' }, border:{ show:false }, label:'PID' });
+        return {scales, axes};
+      }
+
+      let visibleIndex = 0;
+      headers.slice(1).forEach((h, i)=>{
+        if(!visible[i]) return;
+        const scaleName = 'y' + visibleIndex;
+        scales[scaleName] = {
+          range: (u, min, max) => {
+            if(!autoscale[i]){
+              const lo = (manualMin[i]!=null)? manualMin[i] : min;
+              const hi = (manualMax[i]!=null)? manualMax[i] : max;
               return [lo, hi];
             }
-          };
-          axes.push({ side:3, scale: scaleName, stroke:'#9aa4b2', grid:{ show:false }, ticks:{ stroke:'#9aa4b2' }, border:{ show:false }, label:h });
-          visibleIndex++;
-        }
+
+            let lo = Number.POSITIVE_INFINITY;
+            let hi = Number.NEGATIVE_INFINITY;
+            const arr = plotSeries[i] || [];
+            for(let k=0;k<arr.length;k++){
+              const v = arr[k];
+              if(v==null) continue;
+              if(v<lo) lo=v; if(v>hi) hi=v;
+            }
+            if(!isFinite(lo) || !isFinite(hi)) { lo = 0; hi = 1; }
+            if(lo===hi){ lo -= 1; hi += 1; }
+            return [lo, hi];
+          }
+        };
+        axes.push({ side:3, scale: scaleName, stroke:'#9aa4b2', grid:{ show:false }, ticks:{ stroke:'#9aa4b2' }, border:{ show:false }, label:h });
+        visibleIndex++;
       });
+
       return {scales, axes};
     }
 
-    function setupChart(){
-      const w = chartEl.clientWidth || 0;
-      const h = Math.max(320, chartEl.clientHeight || 0);
-      const series = [{label:'time'}].concat(headers.slice(1).map((h,i)=>({
-        label:h,
-        stroke:colorPalette[i%colorPalette.length],
+    function buildSeriesDefs(){
+      const xLabel = (viewMode === 'fft') ? 'Hz' : headers[0];
+      const series = [{label: xLabel}].concat(headers.slice(1).map((h, i)=>({
+        label: h,
+        stroke: colorPalette[i%colorPalette.length],
         width: 2,
         points: { show: false },
-        show: visible[i] // Only show series if visible
+        show: !!visible[i],
       })));
-      // assign per-series scales
-      let scaleIndex = 0;
-      for(let i=0;i<series.length-1;i++) {
-        if(visible[i]) {
-          series[i+1].scale = 'y' + scaleIndex;
-          scaleIndex++;
-        }
+
+      for(let i=0;i<series.length-1;i++){
+        if(!visible[i]) continue;
+        series[i+1].scale = getScaleNameForSeriesIndex(i);
       }
+
+      return series;
+    }
+
+    function drawReferenceLines(u){
+      const ctx = u.ctx;
+      const bbox = u.bbox;
+
+      ctx.save();
+      headers.slice(1).forEach((h, i)=>{
+        if(!visible[i] || !refLineEnabled[i] || refLineValue[i] == null) return;
+
+        const scaleName = getScaleNameForSeriesIndex(i);
+        if(!u.scales[scaleName]) return;
+
+        const yPos = u.valToPos(refLineValue[i], scaleName, true);
+        if(yPos < bbox.top || yPos > bbox.top + bbox.height) return;
+
+        const color = colorPalette[i % colorPalette.length];
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1;
+        ctx.setLineDash([5, 5]);
+        ctx.beginPath();
+        ctx.moveTo(bbox.left, yPos);
+        ctx.lineTo(bbox.left + bbox.width, yPos);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      });
+      ctx.restore();
+    }
+
+    function rebuildChart(){
+      computePlotBuffers();
+
+      const w = chartEl.clientWidth || 0;
+      const h = Math.max(320, chartEl.clientHeight || 0);
       const {scales, axes} = buildScalesAndAxes();
-      
-      // Draw hook for reference lines
-      const drawHook = (u) => {
-        const ctx = u.ctx;
-        const bbox = u.bbox;
-        
-        ctx.save(); // Save canvas state
-        
-        headers.slice(1).forEach((h, i) => {
-          if (!visible[i] || !refLineEnabled[i] || refLineValue[i] == null) return;
-          
-          // Find the scale for this series (map original series index to visible scale index)
-          let scaleIndex = 0;
-          for (let j = 0; j < i; j++) {
-            if (visible[j]) scaleIndex++;
-          }
-          
-          const scaleName = 'y' + scaleIndex;
-          const scale = u.scales[scaleName];
-          if (!scale) return;
-          
-          // Convert value to pixel position
-          const yPos = u.valToPos(refLineValue[i], scaleName, true);
-          
-          // Only draw if yPos is within bounds
-          if (yPos < bbox.top || yPos > bbox.top + bbox.height) return;
-          
-          // Draw horizontal line across the chart
-          const color = colorPalette[i % colorPalette.length];
-          ctx.strokeStyle = color;
-          ctx.lineWidth = 1;
-          ctx.setLineDash([5, 5]); // Dashed line
-          ctx.beginPath();
-          ctx.moveTo(bbox.left, yPos);
-          ctx.lineTo(bbox.left + bbox.width, yPos);
-          ctx.stroke();
-          ctx.setLineDash([]); // Reset dash
-        });
-        
-        ctx.restore(); // Restore canvas state
-      };
-      
+
       const opts = {
-        width:w,
-        height:h,
-        series: series,
+        width: w,
+        height: h,
+        series: buildSeriesDefs(),
         pixelRatio: 1,
         scales,
         axes,
         cursor: { lock: false },
         hooks: {
-          draw: [drawHook]
+          draw: [drawReferenceLines]
         }
       };
-      const data = [times].concat(dataSeries);
-      chartEl.innerHTML='';
+
+      const data = [plotX].concat(plotSeries);
+
+      chartEl.innerHTML = '';
+      if(uplot) uplot.destroy();
       uplot = new uPlot(opts, data, chartEl);
+
       attachTooltip();
       renderLegend();
       uplot.setSize({width: w, height: h});
@@ -301,91 +588,267 @@ var uPlot=function(){"use strict";function e(e,t,l,n){let i;l=l||0;let s=2147483
 
     function scheduleRedraw(){
       if(redrawTimer) return;
-      redrawTimer = setTimeout(()=>{ redrawTimer=null; redraw(); }, 100);
+      redrawTimer = setTimeout(()=>{
+        redrawTimer = null;
+        redraw();
+      }, 100);
     }
 
     function pruneOld(){
-      const ws = Number(winInput.value)||30;
-      const xmax = times.length? times[times.length-1] : 0;
+      const ws = Number(winInput.value) || 30;
+      const xmax = times.length ? times[times.length-1] : 0;
       const xmin = xmax - ws;
-      let drop = 0; while(drop < times.length && times[drop] < xmin) drop++;
-      if(drop>0){
+      let drop = 0;
+      while(drop < times.length && times[drop] < xmin) drop++;
+      if(drop > 0){
         times = times.slice(drop);
         for(let i=0;i<dataSeries.length;i++) dataSeries[i] = dataSeries[i].slice(drop);
       }
     }
 
     function redraw(){
-      pruneOld();
-      if(!uplot){ setupChart(); return; }
-      const data = [times].concat(dataSeries);
-      uplot.setData(data);
+      computePlotBuffers();
+      if(!uplot){
+        rebuildChart();
+        return;
+      }
+      uplot.setData([plotX].concat(plotSeries));
     }
 
-    // UI wiring
-    winInput.addEventListener('change', redraw);
-    pauseBtn.addEventListener('click', ()=>{ paused=!paused; pauseBtn.textContent = paused? 'Resume':'Pause'; });
-    clearBtn.addEventListener('click', ()=>{ times=[]; for(let i=0;i<dataSeries.length;i++) dataSeries[i]=[]; scheduleRedraw(); });
+    // ---- Gyro viz ----
+    function renderGyro(xDeg, yDeg){
+      const w = gyroCanvas.width;
+      const h = gyroCanvas.height;
+
+      gyroCtx.clearRect(0,0,w,h);
+
+      // circle
+      const cx = w/2;
+      const cy = h/2;
+      const r = Math.min(w,h) * 0.42;
+
+      gyroCtx.strokeStyle = 'rgba(154,164,178,0.6)';
+      gyroCtx.lineWidth = 2;
+      gyroCtx.beginPath();
+      gyroCtx.arc(cx, cy, r, 0, Math.PI*2);
+      gyroCtx.stroke();
+
+      // crosshair
+      gyroCtx.strokeStyle = 'rgba(154,164,178,0.25)';
+      gyroCtx.lineWidth = 1;
+      gyroCtx.beginPath();
+      gyroCtx.moveTo(cx-r, cy);
+      gyroCtx.lineTo(cx+r, cy);
+      gyroCtx.moveTo(cx, cy-r);
+      gyroCtx.lineTo(cx, cy+r);
+      gyroCtx.stroke();
+
+      // dot
+      const nx = clamp(xDeg/90, -1, 1);
+      const ny = clamp(yDeg/90, -1, 1);
+      const dx = cx + nx * r;
+      const dy = cy - ny * r;
+
+      gyroCtx.fillStyle = '#7aa2f7';
+      gyroCtx.beginPath();
+      gyroCtx.arc(dx, dy, 8, 0, Math.PI*2);
+      gyroCtx.fill();
+
+      gyroCtx.fillStyle = '#9aa4b2';
+      gyroCtx.font = '12px -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif';
+      gyroCtx.fillText('x: ' + xDeg.toFixed(1) + '°', 10, 18);
+      gyroCtx.fillText('y: ' + yDeg.toFixed(1) + '°', 10, 34);
+    }
+
+    function updateGyroFromValues(vals){
+      if(!gyroToggle.checked) return;
+      const {gxIdx, gyIdx} = getGyroIndices();
+      if(gxIdx < 0 || gyIdx < 0) {
+        gyroText.textContent = 'missing channels';
+        return;
+      }
+
+      const gx = Number(vals[gxIdx]);
+      const gy = Number(vals[gyIdx]);
+      if(!isFinite(gx) || !isFinite(gy)) return;
+
+      gyroText.textContent = headers[gxIdx] + ', ' + headers[gyIdx];
+      renderGyro(gx, gy);
+    }
+
+    function updateGyroUi(){
+      gyroViz.style.display = gyroToggle.checked ? 'block' : 'none';
+      if(!gyroToggle.checked) return;
+
+      const {gxIdx, gyIdx} = getGyroIndices();
+      if(gxIdx < 0 || gyIdx < 0) gyroText.textContent = 'missing channels';
+      else gyroText.textContent = headers[gxIdx] + ', ' + headers[gyIdx];
+    }
+
+    // ---- UI wiring ----
+    winInput.addEventListener('change', ()=>{
+      rebuildChart();
+    });
+
+    fftMaxHzInput.addEventListener('change', ()=>{
+      if(viewMode === 'fft') rebuildChart();
+    });
+
+    modeSel.addEventListener('change', ()=>{
+      viewMode = modeSel.value;
+      updateModeUi();
+    });
+
+    gyroToggle.addEventListener('change', ()=>{
+      updateGyroUi();
+    });
+
+    pauseBtn.addEventListener('click', ()=>{
+      paused = !paused;
+      pauseBtn.textContent = paused ? 'Resume' : 'Pause';
+    });
+
+    clearBtn.addEventListener('click', ()=>{
+      times = [];
+      for(let i=0;i<dataSeries.length;i++) dataSeries[i] = [];
+      scheduleRedraw();
+    });
+
     saveBtn.addEventListener('click', ()=>{
       const rows = [];
       rows.push(headers.join(','));
       for(let i=0;i<times.length;i++){
         const row = [times[i]];
-        for(let s=0;s<dataSeries.length;s++) row.push(dataSeries[s][i]??'');
+        for(let s=0;s<dataSeries.length;s++) row.push(dataSeries[s][i] ?? '');
         rows.push(row.join(','));
       }
       const blob = new Blob([rows.join('\n')], {type:'text/csv'});
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
-      a.download = 'data.csv'; a.click(); URL.revokeObjectURL(a.href);
+      a.download = 'data.csv';
+      a.click();
+      URL.revokeObjectURL(a.href);
     });
 
     function renderSeriesList(){
-      seriesList.innerHTML='';
-      headers.slice(1).forEach((h,i)=>{
-        const row = document.createElement('div'); row.className='series-item';
-        const chk = document.createElement('input'); chk.type='checkbox'; chk.checked = visible[i];
-        const lbl = document.createElement('label'); lbl.textContent=h;
-        const sub = document.createElement('div'); sub.style.gridColumn='1 / span 2';
-        
-        // Scale controls
-        const minI = document.createElement('input'); minI.type='number'; minI.placeholder='min'; if(manualMin[i]!=null) minI.value=manualMin[i];
-        const maxI = document.createElement('input'); maxI.type='number'; maxI.placeholder='max'; if(manualMax[i]!=null) maxI.value=manualMax[i];
-        const autoI = document.createElement('input'); autoI.type='checkbox'; autoI.checked = autoscale[i];
-        const autoL = document.createElement('small'); autoL.textContent='Autoscale';
-        const scaleWrap = document.createElement('div'); scaleWrap.style.display='flex'; scaleWrap.style.gap='6px'; scaleWrap.style.marginBottom='6px'; scaleWrap.append(minI,maxI,autoI,autoL);
-        sub.appendChild(scaleWrap);
-        
-        // Reference line controls
-        const refChk = document.createElement('input'); refChk.type='checkbox'; refChk.checked = refLineEnabled[i] || false;
-        const refValI = document.createElement('input'); refValI.type='number'; refValI.placeholder='ref value'; refValI.style.width='100px'; if(refLineValue[i]!=null) refValI.value=refLineValue[i];
-        refValI.disabled = !refLineEnabled[i];
-        const refL = document.createElement('small'); refL.textContent='Reference line:';
-        const refWrap = document.createElement('div'); refWrap.style.display='flex'; refWrap.style.gap='6px'; refWrap.style.alignItems='center'; refWrap.append(refL,refChk,refValI);
-        sub.appendChild(refWrap);
-        
-        row.append(chk,lbl,sub);
+      seriesList.innerHTML = '';
 
-        chk.addEventListener('change', ()=>{ visible[i]=chk.checked; applyVisibility(); });
-        autoI.addEventListener('change', ()=>{ autoscale[i]=autoI.checked; if(autoscale[i]){ manualMin[i]=null; manualMax[i]=null; minI.value=''; maxI.value=''; } scheduleRedraw(); });
-        minI.addEventListener('change', ()=>{ manualMin[i] = minI.value===''? null : Number(minI.value); autoscale[i]=false; scheduleRedraw(); });
-        maxI.addEventListener('change', ()=>{ manualMax[i] = maxI.value===''? null : Number(maxI.value); autoscale[i]=false; scheduleRedraw(); });
-        
-        refChk.addEventListener('change', ()=>{ 
-          refLineEnabled[i] = refChk.checked; 
+      const pidIndices = getPidIndices();
+      const pidOnlySet = new Set([pidIndices.pidIdx-1, pidIndices.setpointIdx-1]);
+      const lockPid = (viewMode === 'pid');
+
+      headers.slice(1).forEach((h, i)=>{
+        if(lockPid && !pidOnlySet.has(i)) return;
+
+        const row = document.createElement('div');
+        row.className = 'series-item';
+
+        const chk = document.createElement('input');
+        chk.type = 'checkbox';
+        chk.checked = !!visible[i];
+        chk.disabled = lockPid;
+
+        const lbl = document.createElement('label');
+        lbl.textContent = h;
+
+        const sub = document.createElement('div');
+        sub.style.gridColumn = '1 / span 2';
+
+        const minI = document.createElement('input');
+        minI.type = 'number';
+        minI.placeholder = 'min';
+        if(manualMin[i]!=null) minI.value = manualMin[i];
+
+        const maxI = document.createElement('input');
+        maxI.type = 'number';
+        maxI.placeholder = 'max';
+        if(manualMax[i]!=null) maxI.value = manualMax[i];
+
+        const autoI = document.createElement('input');
+        autoI.type = 'checkbox';
+        autoI.checked = autoscale[i];
+
+        const autoL = document.createElement('small');
+        autoL.textContent = 'Autoscale';
+
+        const scaleWrap = document.createElement('div');
+        scaleWrap.style.display = 'flex';
+        scaleWrap.style.gap = '6px';
+        scaleWrap.style.marginBottom = '6px';
+        scaleWrap.append(minI, maxI, autoI, autoL);
+        sub.appendChild(scaleWrap);
+
+        const refChk = document.createElement('input');
+        refChk.type = 'checkbox';
+        refChk.checked = refLineEnabled[i] || false;
+
+        const refValI = document.createElement('input');
+        refValI.type = 'number';
+        refValI.placeholder = 'ref value';
+        refValI.style.width = '100px';
+        if(refLineValue[i]!=null) refValI.value = refLineValue[i];
+        refValI.disabled = !refLineEnabled[i];
+
+        const refL = document.createElement('small');
+        refL.textContent = 'Reference line:';
+
+        const refWrap = document.createElement('div');
+        refWrap.style.display = 'flex';
+        refWrap.style.gap = '6px';
+        refWrap.style.alignItems = 'center';
+        refWrap.append(refL, refChk, refValI);
+        sub.appendChild(refWrap);
+
+        if(lockPid){
+          minI.disabled = true;
+          maxI.disabled = true;
+          autoI.disabled = true;
+          refChk.disabled = true;
+          refValI.disabled = true;
+        }
+
+        row.append(chk, lbl, sub);
+
+        chk.addEventListener('change', ()=>{
+          visible[i] = chk.checked;
+          rebuildChart();
+        });
+
+        autoI.addEventListener('change', ()=>{
+          autoscale[i] = autoI.checked;
+          if(autoscale[i]){
+            manualMin[i] = null;
+            manualMax[i] = null;
+            minI.value = '';
+            maxI.value = '';
+          }
+          scheduleRedraw();
+        });
+
+        minI.addEventListener('change', ()=>{
+          manualMin[i] = (minI.value === '') ? null : Number(minI.value);
+          autoscale[i] = false;
+          scheduleRedraw();
+        });
+
+        maxI.addEventListener('change', ()=>{
+          manualMax[i] = (maxI.value === '') ? null : Number(maxI.value);
+          autoscale[i] = false;
+          scheduleRedraw();
+        });
+
+        refChk.addEventListener('change', ()=>{
+          refLineEnabled[i] = refChk.checked;
           refValI.disabled = !refLineEnabled[i];
-          if(!refLineEnabled[i]) {
+          if(!refLineEnabled[i]){
             refLineValue[i] = null;
             refValI.value = '';
           }
           scheduleRedraw();
         });
-        refValI.addEventListener('change', ()=>{ 
-          refLineValue[i] = refValI.value===''? null : Number(refValI.value);
-          scheduleRedraw();
-        });
-        refValI.addEventListener('input', ()=>{ 
-          refLineValue[i] = refValI.value===''? null : Number(refValI.value);
+
+        refValI.addEventListener('input', ()=>{
+          refLineValue[i] = (refValI.value === '') ? null : Number(refValI.value);
           scheduleRedraw();
         });
 
@@ -393,142 +856,89 @@ var uPlot=function(){"use strict";function e(e,t,l,n){let i;l=l||0;let s=2147483
       });
     }
 
-    function applyVisibility(){
-      if(uplot){
-        // Rebuild the entire chart configuration based on visible series
-        const w = chartEl.clientWidth || 0;
-        const h = Math.max(320, chartEl.clientHeight || 0);
-        
-        // Include ALL series (don't filter), but mark visibility
-        const allSeries = [{label:'time'}].concat(
-          headers.slice(1).map((h,i) => ({
-            label:h,
-            stroke:colorPalette[i%colorPalette.length],
-            width: 2,
-            points: { show: false },
-            show: visible[i] // Mark visibility
-          }))
-        );
-        
-        // Assign scales only to visible series
-        let scaleIndex = 0;
-        for(let i=0; i<visible.length; i++) {
-          if(visible[i]) {
-            allSeries[i+1].scale = 'y' + scaleIndex;
-            scaleIndex++;
-          }
-        }
-        
-        const {scales, axes} = buildScalesAndAxes();
-        
-        // Draw hook for reference lines
-        const drawHook = (u) => {
-          const ctx = u.ctx;
-          const bbox = u.bbox;
-          
-          ctx.save(); // Save canvas state
-          
-          headers.slice(1).forEach((h, i) => {
-            if (!visible[i] || !refLineEnabled[i] || refLineValue[i] == null) return;
-            
-            // Find the scale for this series (map original series index to visible scale index)
-            let scaleIndex = 0;
-            for (let j = 0; j < i; j++) {
-              if (visible[j]) scaleIndex++;
-            }
-            
-            const scaleName = 'y' + scaleIndex;
-            const scale = u.scales[scaleName];
-            if (!scale) return;
-            
-            // Convert value to pixel position
-            const yPos = u.valToPos(refLineValue[i], scaleName, true);
-            
-            // Only draw if yPos is within bounds
-            if (yPos < bbox.top || yPos > bbox.top + bbox.height) return;
-            
-            // Draw horizontal line across the chart
-            const color = colorPalette[i % colorPalette.length];
-            ctx.strokeStyle = color;
-            ctx.lineWidth = 1;
-            ctx.setLineDash([5, 5]); // Dashed line
-            ctx.beginPath();
-            ctx.moveTo(bbox.left, yPos);
-            ctx.lineTo(bbox.left + bbox.width, yPos);
-            ctx.stroke();
-            ctx.setLineDash([]); // Reset dash
-          });
-          
-          ctx.restore(); // Restore canvas state
-        };
-        
-        // Update uPlot with new configuration - include ALL data to keep indices aligned
-        uplot.destroy();
-        uplot = new uPlot({
-          width: w,
-          height: h,
-          series: allSeries,
-          pixelRatio: 1,
-          scales,
-          axes,
-          cursor: { lock: false },
-          hooks: {
-            draw: [drawHook]
-          }
-        }, [times].concat(dataSeries), chartEl);
-        
-        attachTooltip();
-      }
-      renderLegend();
-    }
-
     function renderLegend(){
-      legendEl.innerHTML='';
-      headers.slice(1).forEach((h,i)=>{
-        const pill=document.createElement('span'); 
-        pill.className='pill'; 
-        pill.style.borderColor=colorPalette[i%colorPalette.length];
-        pill.style.backgroundColor=visible[i] ? colorPalette[i%colorPalette.length] : 'transparent';
-        pill.style.color=visible[i] ? '#0f1116' : '#9aa4b2';
-        pill.style.opacity=visible[i]?1:.5; 
-        pill.textContent=h; 
+      legendEl.innerHTML = '';
+      headers.slice(1).forEach((h, i)=>{
+        const pill = document.createElement('span');
+        pill.className = 'pill';
+        pill.style.borderColor = colorPalette[i%colorPalette.length];
+        pill.style.backgroundColor = visible[i] ? colorPalette[i%colorPalette.length] : 'transparent';
+        pill.style.color = visible[i] ? '#0f1116' : '#9aa4b2';
+        pill.style.opacity = visible[i] ? 1 : .5;
+        pill.textContent = h;
         legendEl.appendChild(pill);
-      })
+      });
     }
 
     // Tooltip
     let tooltipEl = null;
     function attachTooltip(){
       if(tooltipEl) tooltipEl.remove();
-      tooltipEl = document.createElement('div'); tooltipEl.className='tooltip'; tooltipEl.style.display='none'; chartEl.appendChild(tooltipEl);
+      tooltipEl = document.createElement('div');
+      tooltipEl.className = 'tooltip';
+      tooltipEl.style.display = 'none';
+      chartEl.appendChild(tooltipEl);
+
       chartEl.addEventListener('mousemove', ()=>{
-        if(!uplot || uplot.cursor.idx==null){ tooltipEl.style.display='none'; return; }
+        if(!uplot || uplot.cursor.idx == null){
+          tooltipEl.style.display = 'none';
+          return;
+        }
+
         const i = uplot.cursor.idx;
-        const t = times[i];
-        let html = '<b>t</b>: '+(t?.toFixed(3));
-        headers.slice(1).forEach((h,si)=>{ const v = dataSeries[si][i]; if(v==null) return; html += '<br><span style="color:'+colorPalette[si%colorPalette.length]+'">'+h+'</span>: '+v; });
+        const x = plotX[i];
+
+        const xLabel = (viewMode === 'fft') ? 'Hz' : 't';
+        let html = '<b>' + xLabel + '</b>: ' + (x == null ? '—' : x.toFixed(3));
+
+        headers.slice(1).forEach((h, si)=>{
+          if(!visible[si]) return;
+          const arr = plotSeries[si] || [];
+          const v = arr[i];
+          if(v == null) return;
+          html += '<br><span style="color:' + colorPalette[si%colorPalette.length] + '">' + h + '</span>: ' + v;
+        });
+
         tooltipEl.innerHTML = html;
-        tooltipEl.style.display='block';
-        tooltipEl.style.left = (uplot.cursor.left+12)+'px';
-        tooltipEl.style.top = (uplot.cursor.top-8)+'px';
+        tooltipEl.style.display = 'block';
+        tooltipEl.style.left = (uplot.cursor.left + 12) + 'px';
+        tooltipEl.style.top = (uplot.cursor.top - 8) + 'px';
       });
-      chartEl.addEventListener('mouseleave', ()=>{ tooltipEl.style.display='none'; });
+
+      chartEl.addEventListener('mouseleave', ()=>{
+        tooltipEl.style.display = 'none';
+      });
     }
 
-    // WebSocket
+    // ---- WebSocket ----
     function connect(){
       const proto = (location.protocol === 'https:') ? 'wss' : 'ws';
       const url = proto + '://' + location.host + '/ws';
       const ws = new WebSocket(url);
-      ws.onopen = ()=>{ statusEl.textContent='WS: connected'; times=[]; for(let i=0;i<dataSeries.length;i++) dataSeries[i]=[]; scheduleRedraw(); };
-      ws.onclose = ()=>{ statusEl.textContent='WS: closed, retrying…'; setTimeout(connect, 1000); };
-      ws.onerror = ()=>{ statusEl.textContent='WS: error'; };
+
+      ws.onopen = ()=>{
+        statusEl.textContent = 'WS: connected';
+        times = [];
+        for(let i=0;i<dataSeries.length;i++) dataSeries[i] = [];
+        scheduleRedraw();
+      };
+
+      ws.onclose = ()=>{
+        statusEl.textContent = 'WS: closed, retrying…';
+        setTimeout(connect, 1000);
+      };
+
+      ws.onerror = ()=>{
+        statusEl.textContent = 'WS: error';
+      };
+
       ws.onmessage = (ev)=>{
         const msg = JSON.parse(ev.data);
-        if(msg.type==='header'){
+        if(msg.type === 'header'){
           if(JSON.stringify(headers) !== JSON.stringify(msg.headers)) {
             headers = msg.headers.slice();
             const n = Math.max(0, headers.length-1);
+
             dataSeries = Array.from({length:n}, ()=>[]);
             autoscale = Array.from({length:n}, ()=>true);
             manualMin = Array.from({length:n}, ()=>null);
@@ -536,38 +946,59 @@ var uPlot=function(){"use strict";function e(e,t,l,n){let i;l=l||0;let s=2147483
             visible = Array.from({length:n}, ()=>false);
             refLineEnabled = Array.from({length:n}, ()=>false);
             refLineValue = Array.from({length:n}, ()=>null);
+
             times = [];
-            renderSeriesList();
-            setupChart();
+
+            updateGyroUi();
+            updateModeUi();
           }
-        } else if(msg.type==='data'){
+        } else if(msg.type === 'meta'){
+          roles = (msg.roles || {});
+          updateGyroUi();
+          if(viewMode === 'pid') updateModeUi();
+        } else if(msg.type === 'data'){
           if(paused) return;
           const vals = msg.values;
           if(!vals || !vals.length) return;
+
           const t = vals[0];
-          if(times.length && t < times[times.length-1]){
-            // out of order; drop
-            return;
-          }
+          if(times.length && t < times[times.length-1]) return;
+
           times.push(t);
           for(let i=1;i<vals.length;i++){
             const sidx = i-1;
-            if(!dataSeries[sidx]) dataSeries[sidx]=[];
+            if(!dataSeries[sidx]) dataSeries[sidx] = [];
             dataSeries[sidx].push(vals[i]);
           }
-          scheduleRedraw();
+
+          updateGyroFromValues(vals);
+
+          if(viewMode === 'fft'){
+            // FFT is heavier; throttle to ~250ms
+            if(!fftTimer){
+              fftTimer = setTimeout(()=>{
+                fftTimer = null;
+                scheduleRedraw();
+              }, 250);
+            }
+          } else {
+            scheduleRedraw();
+          }
         }
       };
     }
 
     window.addEventListener('resize', ()=>{
-      if(uplot){
-        uplot.setSize({ width: chartEl.clientWidth||900, height: Math.max(320, chartEl.clientHeight||420) });
-        scheduleRedraw();
-      }
+      if(!uplot) return;
+      uplot.setSize({ width: chartEl.clientWidth||900, height: Math.max(320, chartEl.clientHeight||420) });
+      scheduleRedraw();
     });
+
+    // Initial UI state
+    viewMode = modeSel.value;
+    updateGyroUi();
     connect();
-    setupChart();
+    rebuildChart();
   })();
   </script>
 </body>

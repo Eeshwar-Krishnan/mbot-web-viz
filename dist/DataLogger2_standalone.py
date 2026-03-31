@@ -115,6 +115,10 @@ class dataLogger:
         Backwards-compatible behavior:
         - If header is not set and `val` is str or list[str], treat it as headers.
         - Otherwise treat `val` as numeric row (list[float]).
+
+        Graceful degradation:
+        - If headers are set and `val` is a string, ignore it (no-op).
+        - If data conversion fails, log raw data to file but skip WebSocket.
         """
 
         if self.header is None:
@@ -126,12 +130,22 @@ class dataLogger:
                 return
             raise ValueError("First appendData() call must provide headers")
 
+        # Silently ignore string data when headers are already set
+        if isinstance(val, str):
+            return
+
         if not isinstance(val, list):
             raise TypeError("appendData() row must be a list of numeric values")
 
-        values: List[float] = [float(v) for v in val]
-        self.graphServer.appendData(values)
-        self.myData.append(values)
+        # Try to convert to numeric values for WebSocket, but log raw data regardless
+        try:
+            values: List[float] = [float(v) for v in val]
+            self.graphServer.appendData(values)
+        except (ValueError, TypeError):
+            # Conversion failed - log raw data to file but skip WebSocket/graph
+            pass
+
+        self.myData.append([str(v) for v in val])
 
 
 class WebSocketHandler:

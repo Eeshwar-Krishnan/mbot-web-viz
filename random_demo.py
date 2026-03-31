@@ -22,7 +22,8 @@ def run_demo(num_channels: int = 3, hz: float = 60.0) -> None:
     dl = dataLogger("test.txt")
 
     headers = [f"ch{k+1}" for k in range(num_channels)] + ["gyro_x", "gyro_y", "pid", "setpoint"]
-    dl.appendHeader(headers)
+    data = ["i t_now Tx Ty Tz u1 u2 u3 theta_x theta_y theta_z psi_1 psi_2 psi_3 dpsi_1 dpsi_2 dpsi_3"]
+    dl.appendHeader(data)
     dl.addGyroXY("gyro_x", "gyro_y")
     dl.addPidTuning("pid", "setpoint")
 

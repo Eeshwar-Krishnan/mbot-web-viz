@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gzip
 import hashlib
 import json
 import struct
@@ -26,6 +27,20 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Union
+
+EMBEDDED_INDEX_HTML_GZ_B64 = "__EMBEDDED_INDEX_HTML_GZ_B64__"
+
+
+def _get_embedded_index_html() -> Optional[str]:
+    """Return embedded index.html content when built as a standalone file."""
+
+    if EMBEDDED_INDEX_HTML_GZ_B64 == "__EMBEDDED_INDEX_HTML_GZ_B64__":
+        return None
+    try:
+        raw = gzip.decompress(base64.b64decode(EMBEDDED_INDEX_HTML_GZ_B64))
+        return raw.decode("utf-8")
+    except Exception:
+        return None
 
 
 class dataLogger:
@@ -191,46 +206,49 @@ class WebSocketHandler:
         """Read a WebSocket message. Returns None on close/error."""
 
         try:
-            header = await self.reader.readexactly(2)
-            if len(header) < 2:
-                return None
+            while True:
+                header = await self.reader.readexactly(2)
+                if len(header) < 2:
+                    return None
 
-            fin_opcode = header[0]
-            mask_length = header[1]
+                fin_opcode = header[0]
+                mask_length = header[1]
 
-            opcode = fin_opcode & 0x0F
-            if opcode == 0x8:  # Close frame
-                return None
+                opcode = fin_opcode & 0x0F
+                if opcode == 0x8:  # Close frame
+                    return None
 
-            length = mask_length & 0x7F
-            mask = (mask_length & 0x80) != 0
+                length = mask_length & 0x7F
+                mask = (mask_length & 0x80) != 0
 
-            if length == 126:
-                length_bytes = await self.reader.readexactly(2)
-                length = struct.unpack(">H", length_bytes)[0]
-            elif length == 127:
-                length_bytes = await self.reader.readexactly(8)
-                length = struct.unpack(">Q", length_bytes)[0]
+                if length == 126:
+                    length_bytes = await self.reader.readexactly(2)
+                    length = struct.unpack(">H", length_bytes)[0]
+                elif length == 127:
+                    length_bytes = await self.reader.readexactly(8)
+                    length = struct.unpack(">Q", length_bytes)[0]
 
-            if mask:
-                masking_key = await self.reader.readexactly(4)
-            else:
-                masking_key = None
+                if mask:
+                    masking_key = await self.reader.readexactly(4)
+                else:
+                    masking_key = None
 
-            payload = await self.reader.readexactly(length)
+                payload = await self.reader.readexactly(length)
 
-            if mask and masking_key:
-                payload = bytes(payload[i] ^ masking_key[i % 4] for i in range(len(payload)))
+                if mask and masking_key:
+                    payload = bytes(payload[i] ^ masking_key[i % 4] for i in range(len(payload)))
 
-            if opcode == 0x1:  # Text frame
-                return payload.decode("utf-8")
-            if opcode == 0x9:  # Ping
-                pong_header = struct.pack(">BB", 0x8A, 0)  # 0x8A = FIN + PONG
-                self.writer.write(pong_header)
-                await self.writer.drain()
-                return await self.read_message()
-
-            return None
+                if opcode == 0x1:  # Text frame
+                    return payload.decode("utf-8")
+                if opcode == 0x9:  # Ping
+                    pong_header = struct.pack(">BB", 0x8A, 0)  # 0x8A = FIN + PONG
+                    self.writer.write(pong_header)
+                    await self.writer.drain()
+                    continue
+                if opcode == 0xA:  # Pong
+                    continue
+                # Ignore unsupported control/data frames and keep reading.
+                continue
         except Exception:
             return None
 
@@ -414,14 +432,16 @@ class RealtimeGraphServer:
         try:
             content = self._index_html_path.read_text(encoding="utf-8")
         except Exception:
-            await self._send_http_response(
-                writer,
-                500,
-                "Internal Server Error",
-                "text/plain",
-                b"Missing or unreadable index.html",
-            )
-            return
+            content = _get_embedded_index_html()
+            if content is None:
+                await self._send_http_response(
+                    writer,
+                    500,
+                    "Internal Server Error",
+                    "text/plain",
+                    b"Missing or unreadable index.html",
+                )
+                return
 
         await self._send_http_response(writer, 200, "OK", "text/html", content.encode("utf-8"))
 

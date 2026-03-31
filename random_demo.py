@@ -13,7 +13,7 @@ def run_demo(num_channels: int = 3, hz: float = 60.0) -> None:
     This demo exercises:
     - time-domain plots
     - FFT mode (sinusoidal channels)
-    - gyro visualizer (gyro_x/gyro_y in degrees)
+    - gyro visualizer (gyro_x/gyro_y in radians)
     - PID mode (pid + setpoint)
 
     The server prepends a `__time_start` column automatically.
@@ -56,9 +56,9 @@ def run_demo(num_channels: int = 3, hz: float = 60.0) -> None:
             val = base[k] + amp[k] * math.sin(0.7 * t + phase[k]) + drift[k] * t * 0.02
             row.append(round(val, 4))
 
-        # gyro in degrees (roughly -90..90)
-        gyro_x = 90.0 * math.sin(0.6 * t)
-        gyro_y = 90.0 * math.sin(0.4 * t + 0.7)
+        # gyro in radians (roughly -pi/2 .. pi/2)
+        gyro_x = (math.pi / 2) * math.sin(0.6 * t)
+        gyro_y = (math.pi / 2) * math.sin(0.4 * t + 0.7)
         row.append(round(gyro_x, 3))
         row.append(round(gyro_y, 3))
 
@@ -94,5 +94,4 @@ if __name__ == "__main__":
         except Exception:
             pass
     run_demo(n, rate)
-
 

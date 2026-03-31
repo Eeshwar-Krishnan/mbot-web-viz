@@ -716,7 +716,7 @@ var uPlot=function(){"use strict";function e(e,t,l,n){let i;l=l||0;let s=2147483
       return {w: rect.width, h: rect.height};
     }
 
-    function renderGyro(xDeg, yDeg){
+    function renderGyro(xRad, yRad){
       const {w, h} = resizeGyroCanvas();
 
       gyroCtx.clearRect(0,0,w,h);
@@ -743,8 +743,9 @@ var uPlot=function(){"use strict";function e(e,t,l,n){let i;l=l||0;let s=2147483
       gyroCtx.stroke();
 
       // dot
-      const nx = clamp(xDeg/90, -1, 1);
-      const ny = clamp(yDeg/90, -1, 1);
+      const maxRad = Math.PI / 2;
+      const nx = clamp(xRad / maxRad, -1, 1);
+      const ny = clamp(yRad / maxRad, -1, 1);
       const dx = cx + nx * r;
       const dy = cy - ny * r;
 
@@ -755,8 +756,8 @@ var uPlot=function(){"use strict";function e(e,t,l,n){let i;l=l||0;let s=2147483
 
       gyroCtx.fillStyle = '#9aa4b2';
       gyroCtx.font = '12px -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif';
-      gyroCtx.fillText('x: ' + xDeg.toFixed(1) + '°', 10, 18);
-      gyroCtx.fillText('y: ' + yDeg.toFixed(1) + '°', 10, 34);
+      gyroCtx.fillText('x: ' + xRad.toFixed(3) + ' rad', 10, 18);
+      gyroCtx.fillText('y: ' + yRad.toFixed(3) + ' rad', 10, 34);
     }
 
     function updateGyroFromValues(vals){
